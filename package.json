@@ -1,6 +1,6 @@
 {
   "name": "react-native-unarchive",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A React Native module to unarchive zip and rar files.",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
