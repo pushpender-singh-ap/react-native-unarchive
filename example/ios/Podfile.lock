@@ -2398,7 +2398,7 @@ PODS:
     - Yoga
   - SocketRocket (0.7.1)
   - SSZipArchive (2.6.0)
-  - Unarchive (1.0.0):
+  - Unarchive (1.0.1):
     - boost
     - DoubleConversion
     - fast_float
@@ -2747,10 +2747,10 @@ SPEC CHECKSUMS:
   ReactNativeFs: f3dacdcf3e377c002507ade0c6fb8c206bab71db
   SocketRocket: d4aabe649be1e368d1318fdf28a022d714d65748
   SSZipArchive: 8a6ee5677c8e304bebc109e39cf0da91ccef22ea
-  Unarchive: ef2ac39f71afb2c18af64405754161efd74aee07
+  Unarchive: d817b0dff1d74744cbcd50c8d29b5c66fe72a557
   UnrarKit: 62f535c7a34ec52d2514b9b148f33dcfa9a9dc39
   Yoga: 064221e341545b28511ea7d59a085819bf499b13
 
 PODFILE CHECKSUM: 88babf7def1fbdd12cdc1007ffb781a6ac7006ca
 
-COCOAPODS: 1.15.2
+COCOAPODS: 1.16.2
