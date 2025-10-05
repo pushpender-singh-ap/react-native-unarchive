@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import {
   Text,
   View,
@@ -14,6 +14,7 @@ import {
 import {
   multiply,
   unarchive,
+  cancelUnarchive,
   type FileInfo,
   type UnarchiveResult,
 } from 'react-native-unarchive';
@@ -26,6 +27,7 @@ import {
   copyFile,
 } from '@dr.pogodin/react-native-fs';
 import { pick } from '@react-native-documents/picker';
+import { PermissionsAndroid, Share } from 'react-native';
 
 const multiplyResult = multiply(3, 7);
 
@@ -35,14 +37,6 @@ const uriToPath = (uri: string): string => {
     return decodeURIComponent(uri.replace('file://', ''));
   }
   return uri;
-};
-
-// Utility function to convert file path to URI if needed
-const pathToUri = (path: string): string => {
-  if (path.startsWith('file://')) {
-    return path;
-  }
-  return `file://${encodeURI(path)}`;
 };
 
 function App() {
@@ -56,12 +50,10 @@ function App() {
 
   const [archivePath, setArchivePath] = useState('');
   const [outputPath, setOutputPath] = useState(() => {
-    if (Platform.OS === 'android') {
-      return `${ExternalStorageDirectoryPath}/Download/UnarchiveApp`;
-    } else {
-      // iOS: Use DocumentDirectoryPath, it should always be available
-      return `${DocumentDirectoryPath || '/tmp'}/UnarchiveApp`;
-    }
+    // Both platforms now require app-scoped directories for security
+    // Android: Use DocumentDirectoryPath (filesDir) which is always allowed
+    // iOS: Use DocumentDirectoryPath as before
+    return `${DocumentDirectoryPath}/UnarchiveApp`;
   });
   const [extractionResult, setExtractionResult] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -69,49 +61,51 @@ function App() {
   const [modalImage, setModalImage] = useState('');
 
   const selectOutputDirectory = async () => {
-    // For now, let's use a simple preset directory or let user type manually
-    Alert.alert('Output Directory', 'Choose where to extract files:', [
-      {
-        text: 'Downloads Folder',
-        onPress: () => {
-          const downloadsPath =
-            Platform.OS === 'android'
-              ? `${ExternalStorageDirectoryPath}/Download/UnarchiveApp`
-              : `${DownloadDirectoryPath || '/var/mobile/Containers/Data/Application/Documents'}/UnarchiveApp`;
-          setOutputPath(downloadsPath);
+    // Security: Only app-scoped directories are allowed on both platforms
+    Alert.alert(
+      'Output Directory',
+      'For security, extraction is limited to app directories. Choose a location:',
+      [
+        {
+          text: 'App Documents',
+          onPress: () => {
+            setOutputPath(`${DocumentDirectoryPath}/UnarchiveApp`);
+          },
         },
-      },
-      {
-        text: 'External Storage',
-        onPress: () => {
-          const externalPath =
-            Platform.OS === 'android'
-              ? `${ExternalStorageDirectoryPath}/UnarchiveApp`
-              : `${DocumentDirectoryPath || '/var/mobile/Containers/Data/Application/Documents'}/UnarchiveApp`;
-          setOutputPath(externalPath);
+        {
+          text: 'App Cache',
+          onPress: () => {
+            const cachePath = DocumentDirectoryPath.replace(
+              '/Documents',
+              '/Library/Caches'
+            );
+            setOutputPath(`${cachePath}/UnarchiveApp`);
+          },
         },
-      },
-      {
-        text: 'Custom Path',
-        onPress: () => {
-          Alert.alert(
-            'Custom Path',
-            'Enter the full path where you want to extract files:',
-            [
-              {
-                text: 'Cancel',
-                style: 'cancel',
-              },
-              {
-                text: 'Use /sdcard/UnarchiveApp',
-                onPress: () => setOutputPath('/sdcard/UnarchiveApp'),
-              },
-            ]
-          );
+        {
+          text: 'App Files (Android)',
+          onPress: () => {
+            if (Platform.OS === 'android') {
+              // Derive the Android app package name from the internal DocumentDirectoryPath
+              // DocumentDirectoryPath on Android looks like: /data/user/0/<package>/files
+              // Use the same package to construct the app-scoped external files path so
+              // it matches the native allowed root and avoids UNARCHIVE_INVALID_PATH.
+              const pkgRegex = /\/data\/user\/(?:0\/)?([^/]+)\/files/;
+              const match = (DocumentDirectoryPath || '').match(pkgRegex);
+              const packageName = match && match[1] ? match[1] : null;
+              const androidPath = packageName
+                ? `${ExternalStorageDirectoryPath}/Android/data/${packageName}/files/UnarchiveApp`
+                : `${DocumentDirectoryPath}/UnarchiveApp`;
+
+              setOutputPath(androidPath);
+            } else {
+              setOutputPath(`${DocumentDirectoryPath}/UnarchiveApp`);
+            }
+          },
         },
-      },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
+        { text: 'Cancel', style: 'cancel' },
+      ]
+    );
   };
 
   const handleUnarchive = async () => {
@@ -174,7 +168,7 @@ function App() {
 
       Alert.alert(
         'Success',
-        `Extracted ${result.files.length} files to:\n${result.outputPath}\n\nFirst file: ${result.files[0]?.name || 'None'}`
+        `Extracted ${result.files.length} files\n\nLocation: ${result.outputPath}\n\nFirst file: ${result.files[0]?.name || 'None'}\n\nNote: Files are in app directory for security.`
       );
 
       // Also check what's actually in the output directory
@@ -193,12 +187,61 @@ function App() {
       } catch (dirError) {
         console.error('Error reading output directory:', dirError);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('=== UNARCHIVE ERROR ===');
       console.error('Error details:', error);
-      Alert.alert('Error', `Failed to extract archive: ${error}`);
+
+      // Handle specific error codes
+      let errorMessage = `Failed to extract archive: ${error.message || error}`;
+
+      if (error.code === 'UNARCHIVE_BUSY') {
+        errorMessage =
+          'Another extraction is already in progress. Please wait for it to complete.';
+      } else if (error.code === 'UNARCHIVE_INVALID_PATH') {
+        errorMessage = `Invalid output path. For security, extraction is only allowed to app directories.\n\nCurrent path: ${outputPath}\n\nPlease use "Select Output Folder" to choose a valid location.`;
+      } else if (error.code === 'UNARCHIVE_ENTRY_INVALID') {
+        errorMessage =
+          'Archive contains unsafe entries (possible ZIP-SLIP attack). The archive may be malicious or corrupted.';
+      } else if (error.code === 'UNARCHIVE_CANCELLED') {
+        errorMessage = 'Extraction was cancelled.';
+      } else if (error.code === 'FILE_NOT_FOUND') {
+        errorMessage = 'Archive file not found. Please select the file again.';
+      }
+
+      // Include debug info if available
+      if (error.userInfo) {
+        const debugInfo: string[] = [];
+        if (error.userInfo.partialFilesCount) {
+          debugInfo.push(`Partial files: ${error.userInfo.partialFilesCount}`);
+        }
+        if (error.userInfo.tempPath) {
+          debugInfo.push(`Temp path: ${error.userInfo.tempPath}`);
+        }
+        if (debugInfo.length > 0) {
+          errorMessage += `\n\nDebug info:\n${debugInfo.join('\n')}`;
+        }
+      }
+
+      Alert.alert('Extraction Error', errorMessage);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleCancelUnarchive = async () => {
+    if (!loading) {
+      Alert.alert('Info', 'No extraction in progress');
+      return;
+    }
+
+    try {
+      console.log('=== CANCELLING UNARCHIVE ===');
+      const result = await cancelUnarchive();
+      console.log('Cancellation result:', result);
+      Alert.alert('Cancelled', 'Extraction has been cancelled');
+    } catch (error) {
+      console.error('Cancellation error:', error);
+      Alert.alert('Error', `Failed to cancel: ${error}`);
     }
   };
 
@@ -285,7 +328,10 @@ function App() {
           try {
             // Create a unique filename to avoid conflicts
             const timestamp = Date.now();
-            const safeFileName = (fileName || 'archive').replace(/[^a-zA-Z0-9.-]/g, '_');
+            const safeFileName = (fileName || 'archive').replace(
+              /[^a-zA-Z0-9.-]/g,
+              '_'
+            );
             const permanentPath = `${DocumentDirectoryPath}/imported_${timestamp}_${safeFileName}`;
 
             console.log('Copying Android content URI to permanent location:');
@@ -438,16 +484,120 @@ function App() {
   const handleImagePress = (path: string) => {
     console.log('=== IMAGE PRESS ===');
     console.log('Original path:', path);
-    
+
     // Ensure proper file URI format for image display
     let imageUri = path;
     if (Platform.OS === 'android' && !path.startsWith('file://')) {
       imageUri = `file://${path}`;
     }
     console.log('Image URI for display:', imageUri);
-    
+
     setShowModal(true);
     setModalImage(imageUri);
+  };
+
+  // Export extracted files to the user's Downloads folder so they are visible
+  // in the system Files app. Note: on Android 11+ scoped storage prevents
+  // writing into shared folders without special APIs; we attempt to copy and
+  // surface friendly errors / fallbacks.
+  const exportToDownloads = async () => {
+    if (extractionResult.length === 0) {
+      Alert.alert('No files', 'There are no extracted files to export');
+      return;
+    }
+
+    if (Platform.OS !== 'android') {
+      Alert.alert(
+        'Unsupported',
+        'Export to Downloads is currently Android-only'
+      );
+      return;
+    }
+
+    // For Android < 29, request WRITE_EXTERNAL_STORAGE
+    const sdk = Platform.Version as number;
+    if (sdk < 29) {
+      try {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+          {
+            title: 'Storage Permission',
+            message:
+              'This app needs permission to write to external storage to export files',
+            buttonNeutral: 'Ask Me Later',
+            buttonNegative: 'Cancel',
+            buttonPositive: 'OK',
+          }
+        );
+
+        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+          Alert.alert(
+            'Permission denied',
+            'Cannot export files without storage permission'
+          );
+          return;
+        }
+      } catch (permErr) {
+        console.error('Permission request failed', permErr);
+        Alert.alert(
+          'Permission error',
+          `Permission request failed: ${permErr}`
+        );
+        return;
+      }
+    }
+
+    const results: { name: string; ok: boolean; error?: string }[] = [];
+    for (const file of extractionResult) {
+      try {
+        const destPath = `${DownloadDirectoryPath}/${file.name}`;
+        console.log('Copying to Downloads:', file.path, '->', destPath);
+        await copyFile(file.path, destPath);
+        const ok = await exists(destPath);
+        if (ok) {
+          results.push({ name: file.name, ok: true });
+        } else {
+          results.push({
+            name: file.name,
+            ok: false,
+            error: 'Verification failed',
+          });
+        }
+      } catch (copyErr: any) {
+        console.error('Export failed for', file.path, copyErr);
+        results.push({
+          name: file.name,
+          ok: false,
+          error: `${copyErr?.message || copyErr}`,
+        });
+      }
+    }
+
+    const successCount = results.filter((r) => r.ok).length;
+    const failed = results.filter((r) => !r.ok);
+
+    let message = `Exported ${successCount}/${results.length} files to your Downloads folder.`;
+    if (failed.length > 0) {
+      message += `\n\nFailed:\n${failed.map((f) => `${f.name}: ${f.error}`).join('\n')}`;
+      message += `\n\nNote: On Android 11+ the system may prevent apps from writing directly to Downloads. Use "Share" on a file to move it to another app or use a file manager export.`;
+    }
+
+    Alert.alert('Export Complete', message);
+  };
+
+  // Share a single file using the system share sheet. This is the recommended
+  // way for users to move files to locations not directly writable by the app.
+  const shareFile = async (filePath: string) => {
+    try {
+      const uri =
+        Platform.OS === 'android' && !filePath.startsWith('file://')
+          ? `file://${filePath}`
+          : filePath;
+      await Share.share({ url: uri, title: 'Share file' });
+    } catch (e: any) {
+      console.error('Share failed', e);
+      Alert.alert('Share failed', `${e?.message || e}`);
+    }
   };
 
   return (
@@ -456,6 +606,9 @@ function App() {
         <Text style={styles.title}>React Native Unarchive</Text>
         <Text style={styles.subtitle}>CBR/CBZ Extraction Demo</Text>
         <Text style={styles.result}>Multiply Test: {multiplyResult}</Text>
+        <Text style={styles.securityNote}>
+          🔒 Secure extraction to app directories only
+        </Text>
       </View>
 
       <View style={styles.section}>
@@ -508,11 +661,27 @@ function App() {
           </Text>
         </TouchableOpacity>
 
+        {loading && (
+          <TouchableOpacity
+            style={[styles.cancelButton]}
+            onPress={handleCancelUnarchive}
+          >
+            <Text style={styles.cancelButtonText}>Cancel Extraction</Text>
+          </TouchableOpacity>
+        )}
+
         <TouchableOpacity
           style={[styles.debugButton]}
           onPress={checkOutputDirectory}
         >
           <Text style={styles.debugButtonText}>Check Output Directory</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.exportButton]}
+          onPress={exportToDownloads}
+        >
+          <Text style={styles.exportButtonText}>Export to Downloads</Text>
         </TouchableOpacity>
       </View>
 
@@ -523,23 +692,43 @@ function App() {
           </Text>
           <ScrollView style={styles.fileList} nestedScrollEnabled={true}>
             {extractionResult.map((file: FileInfo, index: number) => (
-              <TouchableOpacity
-                onPress={() => handleImagePress(file.path)}
-                key={index}
-                style={styles.fileItem}
-              >
-                <Text style={styles.fileName} numberOfLines={2}>
-                  {file.name}
-                </Text>
-                <Text style={styles.fileDetails}>
-                  {formatFileSize(file.size)}
-                </Text>
-                <Text style={styles.filePath} numberOfLines={1}>
-                  {file.path}
-                </Text>
-              </TouchableOpacity>
+              <View key={index} style={styles.fileItemRow}>
+                <TouchableOpacity
+                  onPress={() => handleImagePress(file.path)}
+                  style={styles.fileItemTouchable}
+                >
+                  <Text style={styles.fileName} numberOfLines={2}>
+                    {file.name}
+                  </Text>
+                  <Text style={styles.fileDetails}>
+                    {formatFileSize(file.size)}
+                  </Text>
+                  <Text style={styles.filePath} numberOfLines={1}>
+                    {file.path}
+                  </Text>
+                </TouchableOpacity>
+                <View style={styles.fileActions}>
+                  <TouchableOpacity
+                    style={styles.shareButton}
+                    onPress={() => shareFile(file.path)}
+                  >
+                    <Text style={styles.shareButtonText}>Share</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
             ))}
           </ScrollView>
+
+          <View style={styles.exportRow}>
+            <TouchableOpacity
+              style={styles.exportButton}
+              onPress={exportToDownloads}
+            >
+              <Text style={styles.exportButtonText}>
+                Export All to Downloads
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
       )}
 
@@ -590,6 +779,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#888',
     marginTop: 10,
+  },
+  securityNote: {
+    fontSize: 12,
+    color: '#34C759',
+    marginTop: 8,
+    fontWeight: '500',
   },
   section: {
     backgroundColor: '#fff',
@@ -652,6 +847,18 @@ const styles = StyleSheet.create({
   buttonDisabled: {
     opacity: 0.6,
   },
+  cancelButton: {
+    backgroundColor: '#FF3B30',
+    paddingVertical: 10,
+    borderRadius: 6,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  cancelButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   buttonText: {
     color: '#fff',
     fontSize: 16,
@@ -681,6 +888,48 @@ const styles = StyleSheet.create({
     color: '#888',
     marginTop: 2,
     fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  fileItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#eee',
+  },
+  fileItemTouchable: {
+    flex: 1,
+  },
+  fileActions: {
+    marginLeft: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  shareButton: {
+    backgroundColor: '#007AFF',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+  },
+  shareButtonText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  exportRow: {
+    marginTop: 10,
+    alignItems: 'center',
+  },
+  exportButton: {
+    backgroundColor: '#34C759',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 6,
+  },
+  exportButtonText: {
+    color: '#fff',
+    fontWeight: '600',
   },
   modalContainer: {
     flex: 1,
