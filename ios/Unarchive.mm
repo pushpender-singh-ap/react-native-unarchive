@@ -16,22 +16,39 @@
   return self;
 }
 
+// Helper method to check a canonical path is equal to or contained by a canonical directory.
+- (BOOL)canonicalPath:(NSString *)path isWithinDirectory:(NSString *)directory {
+  if (!path || !directory) {
+    return NO;
+  }
+
+  if ([path isEqualToString:directory]) {
+    return YES;
+  }
+
+  NSString *directoryWithSeparator = [directory stringByAppendingString:@"/"];
+  return [path hasPrefix:directoryWithSeparator];
+}
+
+// Helper method to canonicalize path strings consistently.
+- (NSString *)canonicalPathForPath:(NSString *)path {
+  NSURL *url = [NSURL fileURLWithPath:path];
+  return [[[url URLByResolvingSymlinksInPath] URLByStandardizingPath] path];
+}
+
 // Helper method to validate output path is within app sandbox
 - (BOOL)isOutputPathInSandbox:(NSString *)outputPath
                         error:(NSError **)error {
-  if (!outputPath) {
+  if (!outputPath || outputPath.length == 0) {
     if (error) {
       *error = [NSError errorWithDomain:@"UnarchiveError"
                                    code:-10
-                               userInfo:@{NSLocalizedDescriptionKey: @"Output path is nil"}];
+                               userInfo:@{NSLocalizedDescriptionKey: @"Output path is nil or empty"}];
     }
     return NO;
   }
 
-  // Canonicalize the output path
-  NSURL *outputURL = [NSURL fileURLWithPath:outputPath];
-  NSURL *canonicalOutputURL = [[outputURL URLByResolvingSymlinksInPath] URLByStandardizingPath];
-  NSString *canonicalOutput = [canonicalOutputURL path];
+  NSString *canonicalOutput = [self canonicalPathForPath:outputPath];
 
   // Get allowed sandbox directories
   NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -39,18 +56,14 @@
   NSString *tmpPath = NSTemporaryDirectory();
 
   // Canonicalize sandbox paths
-  NSURL *documentsURL = [[NSURL fileURLWithPath:documentsPath] URLByStandardizingPath];
-  NSURL *cachesURL = [[NSURL fileURLWithPath:cachesPath] URLByStandardizingPath];
-  NSURL *tmpURL = [[NSURL fileURLWithPath:tmpPath] URLByStandardizingPath];
+  NSString *canonicalDocuments = [self canonicalPathForPath:documentsPath];
+  NSString *canonicalCaches = [self canonicalPathForPath:cachesPath];
+  NSString *canonicalTmp = [self canonicalPathForPath:tmpPath];
 
-  NSString *canonicalDocuments = [documentsURL path];
-  NSString *canonicalCaches = [cachesURL path];
-  NSString *canonicalTmp = [tmpURL path];
-
-  // Check if output path is within any allowed directory
-  BOOL isInDocuments = [canonicalOutput hasPrefix:canonicalDocuments];
-  BOOL isInCaches = [canonicalOutput hasPrefix:canonicalCaches];
-  BOOL isInTmp = [canonicalOutput hasPrefix:canonicalTmp];
+  // Check if output path is within any allowed directory using path-boundary checks.
+  BOOL isInDocuments = [self canonicalPath:canonicalOutput isWithinDirectory:canonicalDocuments];
+  BOOL isInCaches = [self canonicalPath:canonicalOutput isWithinDirectory:canonicalCaches];
+  BOOL isInTmp = [self canonicalPath:canonicalOutput isWithinDirectory:canonicalTmp];
 
   if (!isInDocuments && !isInCaches && !isInTmp) {
 #if DEBUG
@@ -77,7 +90,7 @@
 - (BOOL)isSafePath:(NSString *)entryPath
      withinBaseURL:(NSURL *)baseURL
              error:(NSError **)error {
-  if (!entryPath || !baseURL) {
+  if (!entryPath || entryPath.length == 0 || !baseURL) {
     if (error) {
       *error = [NSError errorWithDomain:@"UnarchiveError"
                                    code:-1
@@ -86,26 +99,35 @@
     return NO;
   }
 
-  // Normalize entry path and remove leading slashes or dots
-  NSString *normalizedEntry = [entryPath stringByStandardizingPath];
-  while ([normalizedEntry hasPrefix:@"/"] || [normalizedEntry hasPrefix:@"../"]) {
-    if ([normalizedEntry hasPrefix:@"/"]) {
-      normalizedEntry = [normalizedEntry substringFromIndex:1];
-    } else if ([normalizedEntry hasPrefix:@"../"]) {
-      normalizedEntry = [normalizedEntry substringFromIndex:3];
+  NSString *normalizedEntry = [entryPath stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+
+  // Reject absolute Unix paths, Windows drive-letter paths, UNC paths, and entries
+  // that normalize to the extraction root instead of a child entry. Never strip
+  // traversal components because extraction libraries receive the original name.
+  NSRegularExpression *windowsDrive = [NSRegularExpression regularExpressionWithPattern:@"^[A-Za-z]:"
+                                                                                options:0
+                                                                                  error:nil];
+  BOOL hasWindowsDrive = [windowsDrive firstMatchInString:normalizedEntry
+                                                  options:0
+                                                    range:NSMakeRange(0, normalizedEntry.length)] != nil;
+  if ([normalizedEntry hasPrefix:@"/"] || [normalizedEntry hasPrefix:@"//"] ||
+      hasWindowsDrive || [normalizedEntry isEqualToString:@"."]) {
+    if (error) {
+      *error = [NSError errorWithDomain:@"UnarchiveError"
+                                   code:-2
+                               userInfo:@{
+                                 NSLocalizedDescriptionKey: @"Archive contains unsafe absolute path",
+                                 @"entryPath": entryPath
+                               }];
     }
+    return NO;
   }
 
-  // Construct the full destination path
-  NSURL *destinationURL = [baseURL URLByAppendingPathComponent:normalizedEntry];
-  NSURL *canonicalDestination = [destinationURL URLByStandardizingPath];
-  NSURL *canonicalBase = [baseURL URLByStandardizingPath];
+  NSString *basePath = [[baseURL URLByStandardizingPath] path];
+  NSString *destinationPath = [[basePath stringByAppendingPathComponent:normalizedEntry] stringByStandardizingPath];
 
-  // Check if canonical destination is within canonical base
-  NSString *destPath = [canonicalDestination path];
-  NSString *basePath = [canonicalBase path];
-
-  if (![destPath hasPrefix:basePath]) {
+  if (![self canonicalPath:destinationPath isWithinDirectory:basePath] ||
+      [destinationPath isEqualToString:basePath]) {
 #if DEBUG
     NSLog(@"[Unarchive] ZIP-SLIP detected: Entry '%@' would escape base directory", entryPath);
 #endif
@@ -631,19 +653,50 @@
   NSLog(@"[Unarchive] Starting CBZ extraction: %@", [archivePath lastPathComponent]);
 #endif
 
-  // Note - SSZipArchive performs its own path validation, but we add post-extraction validation
-  BOOL success = [SSZipArchive unzipFileAtPath:archivePath
-                                 toDestination:tempPath];
+  NSError * __autoreleasing error = nil;
+  __block NSError *unsafeEntryError = nil;
 
-  if (!success) {
+  // Validate each ZIP entry name before accepting the extraction result.
+  BOOL success = [SSZipArchive unzipFileAtPath:archivePath
+                                 toDestination:tempPath
+                            preserveAttributes:YES
+                                     overwrite:YES
+                                nestedZipLevel:0
+                                      password:nil
+                                         error:&error
+                                      delegate:nil
+                               progressHandler:^(NSString *entry,
+                                                 unz_file_info zipInfo,
+                                                 long entryNumber,
+                                                 long total) {
+    (void)zipInfo;
+    (void)entryNumber;
+    (void)total;
+    if (!unsafeEntryError) {
+      NSError * __autoreleasing pathError = nil;
+      NSURL *tempBaseURL = [NSURL fileURLWithPath:tempPath];
+      if (![self isSafePath:entry withinBaseURL:tempBaseURL error:&pathError]) {
+        unsafeEntryError = pathError;
+      }
+    }
+  }
+                             completionHandler:nil];
+
+  if (!success || unsafeEntryError) {
 #if DEBUG
-    NSLog(@"[Unarchive] Error: Failed to extract CBZ archive");
+    NSLog(@"[Unarchive] Error: Failed to extract CBZ archive: %@",
+          unsafeEntryError ? unsafeEntryError.localizedDescription : error.localizedDescription);
 #endif
     [fileManager removeItemAtPath:tempPath error:nil];
+    NSString *errorCode = unsafeEntryError ? @"UNSAFE_PATH" : @"EXTRACTION_ERROR";
+    NSString *errorMessage = unsafeEntryError
+        ? @"Archive contains unsafe path that attempts to escape extraction directory"
+        : @"Failed to extract CBZ archive using SSZipArchive";
+    NSError *reportedError = unsafeEntryError ?: error;
     [self rejectOnce:reject
-                code:@"EXTRACTION_ERROR"
-             message:@"Failed to extract CBZ archive using SSZipArchive"
-               error:nil
+                code:errorCode
+             message:errorMessage
+               error:reportedError
              invoked:cbInvoked.get()];
     _activeExtraction.store(false);
     _currentTempPath = nil; // Clear temp path
@@ -686,7 +739,7 @@
     NSURL *canonicalFileURL = [[fileURL URLByResolvingSymlinksInPath] URLByStandardizingPath];
     NSString *canonicalFilePath = [canonicalFileURL path];
 
-    if (![canonicalFilePath hasPrefix:canonicalTempPath]) {
+    if (![self canonicalPath:canonicalFilePath isWithinDirectory:canonicalTempPath]) {
 #if DEBUG
       NSLog(@"[Unarchive] Error: File escaped temp directory: %@ (canonical: %@), temp: %@", [fileURL path], canonicalFilePath, canonicalTempPath);
 #endif

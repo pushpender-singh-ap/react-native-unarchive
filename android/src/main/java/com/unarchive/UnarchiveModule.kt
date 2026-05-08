@@ -61,7 +61,7 @@ class UnarchiveModule(reactContext: ReactApplicationContext) :
       ).filterNotNull()
       
       return allowedRoots.any { root ->
-        canonicalPath.startsWith(root)
+        canonicalPath == root || canonicalPath.startsWith(root + File.separator)
       }
     } catch (e: Exception) {
       return false
@@ -71,10 +71,22 @@ class UnarchiveModule(reactContext: ReactApplicationContext) :
   // Zip-slip sanitization per entry
   private fun isSafeEntryPath(entryPath: String, tempDir: File): File? {
     try {
-      val destFile = File(tempDir, entryPath).canonicalFile
-      val tempDirCanonical = tempDir.canonicalPath + File.separator
+      if (entryPath.isBlank() || entryPath.indexOf('\u0000') >= 0) {
+        return null
+      }
+
+      val normalizedEntryPath = entryPath.replace('\\', File.separatorChar)
+      val entryFile = File(normalizedEntryPath)
+      if (entryFile.isAbsolute) {
+        return null
+      }
+
+      val destFile = File(tempDir, normalizedEntryPath).canonicalFile
+      val tempDirCanonical = tempDir.canonicalFile
+      val tempDirPath = tempDirCanonical.path
+      val destPath = destFile.path
       
-      if (!destFile.path.startsWith(tempDirCanonical)) {
+      if (destPath != tempDirPath && !destPath.startsWith(tempDirPath + File.separator)) {
         return null
       }
       return destFile
